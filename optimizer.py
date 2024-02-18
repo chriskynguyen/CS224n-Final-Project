@@ -77,7 +77,7 @@ class AdamW(Optimizer):
                 state['m_t'] = beta1 * state['m_t'] + (1 - beta1) * grad
                 # Update biased second raw moment estimate
                 state['v_t'] = beta2 *  state['v_t'] + (1 - beta2) * grad**2
-
+                """ ###########Original Implementation############### 
                 if group["correct_bias"]:
                     # Compute bias-corrected first moment estimate
                     m_t_corrected = state['m_t'] / (1 - beta1**state["step"])
@@ -90,5 +90,12 @@ class AdamW(Optimizer):
                 # Apply weight decay
                 if weight_decay != 0:
                     p.data -= alpha * weight_decay * p.data
-
+                """
+                # Efficient version of algorithm explained in pseudo-code note
+                alpha_t = alpha * (1 - beta2**state["step"])**0.5 / (1 - beta1**state["step"])
+                p.data -= alpha_t * state['m_t'] / (torch.sqrt(state['v_t']) + eps)
+                # Apply weight decay
+                if weight_decay != 0:
+                    p.data -= alpha * weight_decay * p.data
+                
         return loss
