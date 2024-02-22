@@ -227,7 +227,7 @@ class BertEmbeddings(nn.Module):
 
 
 class BertEncoder(nn.Module):
-  def __init__(self, config):
+  def __init__(self, config): 
     super().__init__()
     self.multis = [True if i < 999 else False for i in range(config.num_hidden_layers)]
     self.bert_layers = nn.ModuleList([BERTLayer(config, mult=mult) for mult in self.multis])
