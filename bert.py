@@ -1,5 +1,6 @@
-# Retrofitted code for PALs
-# Revised to match HuggingFace BERT implementation
+# Retrofitted code for PALs referring to 
+# https://github.com/AsaCooperStickland/Bert-n-Pals for implementation of PALs
+# particularly BertPals, parts of BertLayer, and the encoder section in BertModel
 
 import torch
 import torch.nn as nn
@@ -93,7 +94,7 @@ class BertSelfAttention(nn.Module):
 
 class BertPals(nn.Module):
   """
-  Class implementing task specific PALs layer (TS)
+  Class implementing task specific PALs layer (TS). Reference
   Equation: TS(h) = V_D (SA(V_E(h))) 
   V_E is the encoder layer and V_D is the decoder layer
   """
@@ -103,7 +104,7 @@ class BertPals(nn.Module):
     self.encoder_layer = nn.Linear(config.hidden_size, HIDDEN_SIZE_AUG)
     self.decoder_layer = nn.Linear(HIDDEN_SIZE_AUG, config.hidden_size)
     # Attention without the final matrix multiply.
-    self.attn = BertSelfAttention(config, 6)
+    self.attn = BertSelfAttention(config, 12)
     self.hidden_act_fn = F.gelu
 
   def forward(self, hidden_states, attention_mask=None):
@@ -266,7 +267,7 @@ class BertModel(BertPreTrainedModel):
     extended_attention_mask: torch.Tensor = get_extended_attention_mask(attention_mask, self.dtype)
 
     # Pass the hidden states through the encoder layers.
-    for layer_module in self.bert_layers:
+    for j, layer_module in enumerate(self.bert_layers):
       # Feed the encoding from the last bert_layer to the next.
       hidden_states = layer_module(hidden_states, extended_attention_mask, i)
 
