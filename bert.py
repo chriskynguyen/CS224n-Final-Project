@@ -103,8 +103,8 @@ class BertPals(nn.Module):
     # Encoder and decoder matrices project down to the smaller dimension
     self.encoder_layer = nn.Linear(config.hidden_size, HIDDEN_SIZE_AUG)
     self.decoder_layer = nn.Linear(HIDDEN_SIZE_AUG, config.hidden_size)
-    # Attention without the final matrix multiply.
-    self.attn = BertSelfAttention(config, 12)
+    
+    self.attn = BertSelfAttention(config, 6)
     self.hidden_act_fn = F.gelu
 
   def forward(self, hidden_states, attention_mask=None):
