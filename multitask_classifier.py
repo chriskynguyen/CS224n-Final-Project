@@ -95,8 +95,8 @@ class MultitaskBERT(nn.Module):
         Thus, your output should contain 5 logits for each sentence.
         '''
         ### TODO
-        logits = self.forward(input_ids, attention_mask)
-        logits = self.sentiment_classifier(logits)
+        output = self.forward(input_ids, attention_mask)
+        logits = self.sentiment_classifier(output)
         return logits
 
     def predict_paraphrase(self,
@@ -107,10 +107,10 @@ class MultitaskBERT(nn.Module):
         during evaluation.
         '''
         ### TODO
-        logits_1 = self.forward(input_ids_1, attention_mask_1)
-        logits_2 = self.forward(input_ids_2, attention_mask_2)
-        combined_logits = torch.cat((logits_1, logits_2), dim=1)
-        logits = self.paraphrase_classifier(combined_logits)
+        output_1 = self.forward(input_ids_1, attention_mask_1)
+        output_2 = self.forward(input_ids_2, attention_mask_2)
+        combined_output = torch.cat((output_1, output_2), dim=1)
+        logits = self.paraphrase_classifier(combined_output)
         return logits.float()
 
     def predict_similarity(self,
@@ -120,10 +120,10 @@ class MultitaskBERT(nn.Module):
         Note that your output should be unnormalized (a logit).
         '''
         ### TODO
-        logits_1 = self.forward(input_ids_1, attention_mask_1)
-        logits_2 = self.forward(input_ids_2, attention_mask_2)
-        combined_logits = torch.cat((logits_1, logits_2), dim=1)
-        logits = self.similarity_classifier(combined_logits)
+        output_1 = self.forward(input_ids_1, attention_mask_1)
+        output_2 = self.forward(input_ids_2, attention_mask_2)
+        combined_output = torch.cat((output_1, output_2), dim=1)
+        logits = self.similarity_classifier(combined_output)
         return logits
 
 
@@ -174,7 +174,7 @@ def train_multitask(args):
                                         collate_fn=para_dev_data.collate_fn)
 
     # Semantic Textual Similarity (STS)
-    sts_train_data = SentencePairDataset(sts_train_data, args)
+    sts_train_data = SentencePairDataset(sts_train_data, args, isRegression=True)
     sts_dev_data = SentencePairDataset(sts_dev_data, args, isRegression=True)
 
     sts_train_dataloader = DataLoader(sts_train_data, shuffle=True, batch_size=args.batch_size,
@@ -198,7 +198,7 @@ def train_multitask(args):
     lr = args.lr
     optimizer = AdamW(model.parameters(), lr=lr)
     best_dev_acc = 0
-    steps_per_epoch = 900
+    steps_per_epoch = 1200
 
     # Run for the specified number of epochs.
     for epoch in range(args.epochs):
@@ -229,7 +229,6 @@ def train_multitask(args):
                 batch = next(iter(para_train_dataloader))
                 input_ids1, attention_mask1, input_ids2, attention_mask2, labels = (
                     batch['token_ids_1'], batch['attention_mask_1'], batch['token_ids_2'], batch['attention_mask_2'], batch['labels'])
-                #labels = labels.unsqueeze(1)  
                 labels = labels.to(device).float()
                 optimizer.zero_grad()
                 logits = model.predict_paraphrase(input_ids1.to(device), attention_mask1.to(device),
@@ -247,13 +246,13 @@ def train_multitask(args):
             loss.backward()
             optimizer.step()
 
-            train_loss[task_id] += loss.item()
+            train_loss[task_id] += loss.item() 
             num_batches += 1
 
-        train_avg_loss = [l / num_batches for l in train_loss]  # Average loss over all batches
+        train_avg_loss = [loss / num_batches for loss in train_loss]  # Average loss over all batches
 
-        train_acc_sst, _, _, train_acc_para, _, _, train_acc_sts, *_ = model_eval_multitask(sst_train_dataloader, para_dev_dataloader, sts_train_dataloader, model, device)
-        dev_acc_sst, _, _, dev_acc_para, _, _, dev_acc_sts, *_ = model_eval_multitask(sst_dev_dataloader, para_dev_dataloader, sts_dev_dataloader, model, device)
+        train_acc_sst, _, _, train_acc_para, _, _, train_acc_sts, _, _ = model_eval_multitask(sst_train_dataloader, para_dev_dataloader, sts_train_dataloader, model, device)
+        dev_acc_sst, _, _, dev_acc_para, _, _, dev_acc_sts, _, _ = model_eval_multitask(sst_dev_dataloader, para_dev_dataloader, sts_dev_dataloader, model, device)
 
         dev_acc = [dev_acc_sst, dev_acc_para, dev_acc_sts]
         if any(acc > best_dev_acc for acc in dev_acc):
@@ -262,14 +261,17 @@ def train_multitask(args):
 
         print(
             f"Epoch {epoch}: "
-            f"train avg loss :: {train_avg_loss :.3f}, "
-            f"train acc sst :: {train_acc_sst :.3f}, "
-            f"dev acc sst :: {dev_acc_sst :.3f}, "
-            f"train acc para :: {train_acc_para :.3f}, "
-            f"dev acc para :: {dev_acc_para :.3f}, "
-            f"train acc sts :: {train_acc_sts :.3f}, "
-            f"dev acc sts :: {dev_acc_sts :.3f}, "
+            f"train avg loss sst:: {train_avg_loss[0]:.3f}, "
+            f"train acc sst :: {train_acc_sst:.3f}, "
+            f"dev acc sst :: {dev_acc_sst:.3f}, "
+            f"train avg loss para:: {train_avg_loss[1]:.3f}, "
+            f"train acc para :: {train_acc_para:.3f}, "
+            f"dev acc para :: {dev_acc_para:.3f}, "
+            f"train avg loss sts:: {train_avg_loss[2]:.3f}, "
+            f"train acc sts :: {train_acc_sts:.3f}, "
+            f"dev acc sts :: {dev_acc_sts:.3f}"
         )
+        
 
 
 def test_multitask(args):
@@ -390,8 +392,8 @@ def get_args():
     parser.add_argument("--sts_dev_out", type=str, default="predictions/sts-dev-output.csv")
     parser.add_argument("--sts_test_out", type=str, default="predictions/sts-test-output.csv")
 
-    parser.add_argument("--batch_size", help='sst: 64, cfimdb: 8 can fit a 12GB GPU', type=int, default=8)
-    parser.add_argument("--hidden_dropout_prob", type=float, default=0.3)
+    parser.add_argument("--batch_size", help='sst: 64, cfimdb: 8 can fit a 12GB GPU', type=int, default=16)
+    parser.add_argument("--hidden_dropout_prob", type=float, default=0.1)
     parser.add_argument("--lr", type=float, help="learning rate", default=1e-5)
 
     args = parser.parse_args()
