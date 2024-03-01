@@ -49,7 +49,6 @@ def seed_everything(seed=11711):
     torch.backends.cudnn.deterministic = True
 
 
-BERT_HIDDEN_SIZE = 768
 
 class MultitaskBERT(nn.Module):
     '''
@@ -71,9 +70,23 @@ class MultitaskBERT(nn.Module):
         # You will want to add layers here to perform the downstream tasks.
         ### TODO
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
-        self.sentiment_classifier = nn.Linear(config.hidden_size, 5)
-        self.paraphrase_classifier = nn.Linear(config.hidden_size*2, 1)
-        self.similarity_classifier = nn.Linear(config.hidden_size*2, 1)
+        self.sentiment_classifier= nn.Sequential(
+            nn.Linear(config.hidden_size, config.hidden_size),
+            nn.ReLU(),
+            nn.Linear(config.hidden_size, config.hidden_size),
+            nn.ReLU(),
+            nn.Linear(config.hidden_size, 5)
+        )
+        self.paraphrase_classifier = nn.Sequential(
+            nn.Linear(config.hidden_size*2, config.hidden_size),
+            nn.ReLU(),
+            nn.Linear(config.hidden_size, 1)
+        )
+        self.similarity_classifier = nn.Sequential(
+            nn.Linear(config.hidden_size*2, config.hidden_size),
+            nn.ReLU(),
+            nn.Linear(config.hidden_size, 1)
+        )
 
     def forward(self, input_ids, attention_mask):
         'Takes a batch of sentences and produces embeddings for them.'
@@ -198,7 +211,7 @@ def train_multitask(args):
     lr = args.lr
     optimizer = AdamW(model.parameters(), lr=lr)
     best_dev_acc = 0
-    steps_per_epoch = 1200
+    steps_per_epoch = 2000
 
     # Run for the specified number of epochs.
     for epoch in range(args.epochs):
@@ -211,11 +224,11 @@ def train_multitask(args):
 
         model.train()
         train_loss = [0. for i in range(3)] # separate loss for each task
-        num_batches = 0
+        num_batches = [0. for i in range(3)]
         task_id = 0
         for step in tqdm(range(steps_per_epoch), desc=f'train-{epoch}', disable=TQDM_DISABLE):
             task_id = np.random.choice(3, p=probs)
-            loss_sum = 0
+
             # Load batch based on task ID
             if task_id == 0:
                 batch = next(iter(sst_train_dataloader))
@@ -247,9 +260,9 @@ def train_multitask(args):
             optimizer.step()
 
             train_loss[task_id] += loss.item() 
-            num_batches += 1
+            num_batches[task_id] += 1
 
-        train_avg_loss = [loss / num_batches for loss in train_loss]  # Average loss over all batches
+        train_avg_loss = [loss / num_batches[i] if num_batches[i] != 0 else 0 for i, loss in enumerate(train_loss)] # Average loss over all batches
 
         train_acc_sst, _, _, train_acc_para, _, _, train_acc_sts, _, _ = model_eval_multitask(sst_train_dataloader, para_dev_dataloader, sts_train_dataloader, model, device)
         dev_acc_sst, _, _, dev_acc_para, _, _, dev_acc_sts, _, _ = model_eval_multitask(sst_dev_dataloader, para_dev_dataloader, sts_dev_dataloader, model, device)
@@ -259,20 +272,9 @@ def train_multitask(args):
             best_dev_acc = max(dev_acc)
             save_model(model, optimizer, args, config, args.filepath)
 
-        print(
-            f"Epoch {epoch}: "
-            f"train avg loss sst:: {train_avg_loss[0]:.3f}, "
-            f"train acc sst :: {train_acc_sst:.3f}, "
-            f"dev acc sst :: {dev_acc_sst:.3f}, "
-            f"train avg loss para:: {train_avg_loss[1]:.3f}, "
-            f"train acc para :: {train_acc_para:.3f}, "
-            f"dev acc para :: {dev_acc_para:.3f}, "
-            f"train avg loss sts:: {train_avg_loss[2]:.3f}, "
-            f"train acc sts :: {train_acc_sts:.3f}, "
-            f"dev acc sts :: {dev_acc_sts:.3f}"
-        )
+        print(f"Epoch {epoch}: train avg loss sst:: {train_avg_loss[0]:.3f}, train avg loss para:: {train_avg_loss[1]:.3f}, train avg loss sts:: {train_avg_loss[2]:.3f}")
         
-
+        
 
 def test_multitask(args):
     '''Test and save predictions on the dev and test sets of all three tasks.'''
@@ -393,7 +395,7 @@ def get_args():
     parser.add_argument("--sts_test_out", type=str, default="predictions/sts-test-output.csv")
 
     parser.add_argument("--batch_size", help='sst: 64, cfimdb: 8 can fit a 12GB GPU', type=int, default=16)
-    parser.add_argument("--hidden_dropout_prob", type=float, default=0.1)
+    parser.add_argument("--hidden_dropout_prob", type=float, default=0.3)
     parser.add_argument("--lr", type=float, help="learning rate", default=1e-5)
 
     args = parser.parse_args()
