@@ -1,35 +1,22 @@
-# Retrofitted code for PALs referring to 
-# https://github.com/AsaCooperStickland/Bert-n-Pals for implementation of PALs
-# particularly BertPals, parts of BertLayer, and the encoder section in BertModel
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from base_bert import BertPreTrainedModel
 from utils import *
 
-HIDDEN_SIZE_AUG = 204
-NUM_TASKS = 3
-
 
 class BertSelfAttention(nn.Module):
-  def __init__(self, config, multi_params=None):
+  def __init__(self, config):
     super().__init__()
-    if multi_params is not None: # used for pals
-      self.num_attention_heads = multi_params
-      self.attention_head_size = int(HIDDEN_SIZE_AUG / self.num_attention_heads)
-      self.all_head_size = self.num_attention_heads * self.attention_head_size
-      hidden_size = HIDDEN_SIZE_AUG
-    else:
-      self.num_attention_heads = config.num_attention_heads
-      self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
-      self.all_head_size = self.num_attention_heads * self.attention_head_size
-      hidden_size = config.hidden_size
+
+    self.num_attention_heads = config.num_attention_heads
+    self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
+    self.all_head_size = self.num_attention_heads * self.attention_head_size
 
     # Initialize the linear transformation layers for key, value, query.
-    self.query = nn.Linear(hidden_size, self.all_head_size)
-    self.key = nn.Linear(hidden_size, self.all_head_size)
-    self.value = nn.Linear(hidden_size, self.all_head_size)
+    self.query = nn.Linear(config.hidden_size, self.all_head_size)
+    self.key = nn.Linear(config.hidden_size, self.all_head_size)
+    self.value = nn.Linear(config.hidden_size, self.all_head_size)
     # This dropout is applied to normalized attention scores following the original
     # implementation of transformer. Although it is a bit unusual, we empirically
     # observe that it yields better performance.
@@ -75,6 +62,7 @@ class BertSelfAttention(nn.Module):
     attn_value = attn_value.transpose(1, 2).contiguous().view(query.size(0), query.size(-2), self.all_head_size) # self.all_head_size == hidden_size
     return attn_value
 
+
   def forward(self, hidden_states, attention_mask):
     """
     hidden_states: [bs, seq_len, hidden_state]
@@ -92,31 +80,8 @@ class BertSelfAttention(nn.Module):
     return attn_value
 
 
-class BertPals(nn.Module):
-  """
-  Class implementing task specific PALs layer (TS). Reference
-  Equation: TS(h) = V_D (SA(V_E(h))) 
-  V_E is the encoder layer and V_D is the decoder layer
-  """
-  def __init__(self, config):
-    super().__init__()
-    # Encoder and decoder matrices project down to the smaller dimension
-    self.encoder_layer = nn.Linear(config.hidden_size, HIDDEN_SIZE_AUG)
-    self.decoder_layer = nn.Linear(HIDDEN_SIZE_AUG, config.hidden_size)
-    
-    self.attn = BertSelfAttention(config, 12)
-    self.hidden_act_fn = F.gelu
-
-  def forward(self, hidden_states, attention_mask=None):
-    hidden_states_aug = self.encoder_layer(hidden_states) # hidden_states_aug = V_E(h)
-    hidden_states_aug = self.attn(hidden_states_aug, attention_mask)  # hidden_states_aug = SA(hidden_states_aug)
-    hidden_states = self.decoder_layer(hidden_states_aug) # hidden_states = V_D(hidden_states_aug)
-    hidden_states = self.hidden_act_fn(hidden_states) 
-    return hidden_states
-
-
 class BertLayer(nn.Module):
-  def __init__(self, config, mult=False):
+  def __init__(self, config):
     super().__init__()
     # Multi-head attention.
     self.self_attention = BertSelfAttention(config)
@@ -131,10 +96,6 @@ class BertLayer(nn.Module):
     self.out_dense = nn.Linear(config.intermediate_size, config.hidden_size)
     self.out_layer_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
     self.out_dropout = nn.Dropout(config.hidden_dropout_prob)
-    if mult:
-      multi = BertPals(config)
-      self.multi_layers = nn.ModuleList([copy.deepcopy(multi) for _ in range(NUM_TASKS)])
-    self.mult = mult
 
   def add_norm(self, input, output, dense_layer, dropout, ln_layer):
     """
@@ -157,7 +118,7 @@ class BertLayer(nn.Module):
     return norm
 
 
-  def forward(self, hidden_states, attention_mask, i=0):
+  def forward(self, hidden_states, attention_mask):
     """
     hidden_states: either from the embedding layer (first BERT layer) or from the previous BERT layer
     as shown in the left of Figure 1 of https://arxiv.org/pdf/1706.03762.pdf.
@@ -174,14 +135,10 @@ class BertLayer(nn.Module):
     att_norm = self.add_norm(hidden_states, att_output, self.attention_dense, self.attention_dropout, self.attention_layer_norm)
     # Feed forward layer
     feed_output = self.interm_af(self.interm_dense(att_norm))
-    # Add PALs to final output
-    if self.mult:
-      extra_pals = self.multi_layers[i](hidden_states, attention_mask)
-      layer_output = self.add_norm(att_norm + extra_pals, feed_output, self.out_dense, self.out_dropout, self.out_layer_norm)
-    else:
-      # Add-norm for feed forward layer
-      layer_output = self.add_norm(att_norm, feed_output, self.out_dense, self.out_dropout, self.out_layer_norm)
-    return layer_output
+    # Add-norm for feed forward layer
+    feed_norm = self.add_norm(att_norm, feed_output, self.out_dense, self.out_dropout, self.out_layer_norm)
+    return feed_norm
+
 
 
 class BertModel(BertPreTrainedModel):
@@ -208,19 +165,7 @@ class BertModel(BertPreTrainedModel):
     self.register_buffer('position_ids', position_ids)
 
     # BERT encoder.
-    self.multis = [True if i < 999 else False for i in range(config.num_hidden_layers)]
-    self.bert_layers = nn.ModuleList([BertLayer(config, mult=mult) for mult in self.multis])
-
-    dense_encoder = nn.Linear(config.hidden_size, HIDDEN_SIZE_AUG)
-    # Shared encoder and decoder across layers
-    self.mult_encoder_layer = nn.ModuleList([copy.deepcopy(dense_encoder) for _ in range(NUM_TASKS)])
-    dense_decoder = nn.Linear(HIDDEN_SIZE_AUG, config.hidden_size)
-    self.mult_decoder_layer = nn.ModuleList([copy.deepcopy(dense_decoder) for _ in range(NUM_TASKS)])
-    for l, layer in enumerate(self.bert_layers):
-      if self.multis[l]:
-        for i, lay in enumerate(layer.multi_layers):
-          lay.encoder_layer = self.mult_encoder_layer[i]
-          lay.decoder_layer = self.mult_decoder_layer[i]
+    self.bert_layers = nn.ModuleList([BertLayer(config) for _ in range(config.num_hidden_layers)])
 
     # [CLS] token transformations.
     self.pooler_dense = nn.Linear(config.hidden_size, config.hidden_size)
@@ -255,7 +200,7 @@ class BertModel(BertPreTrainedModel):
     return self.embed_dropout(embed_norm)
 
 
-  def encode(self, hidden_states, attention_mask, i=0):
+  def encode(self, hidden_states, attention_mask):
     """
     hidden_states: the output from the embedding layer [batch_size, seq_len, hidden_size]
     attention_mask: [batch_size, seq_len]
@@ -267,9 +212,9 @@ class BertModel(BertPreTrainedModel):
     extended_attention_mask: torch.Tensor = get_extended_attention_mask(attention_mask, self.dtype)
 
     # Pass the hidden states through the encoder layers.
-    for j, layer_module in enumerate(self.bert_layers):
+    for i, layer_module in enumerate(self.bert_layers):
       # Feed the encoding from the last bert_layer to the next.
-      hidden_states = layer_module(hidden_states, extended_attention_mask, i)
+      hidden_states = layer_module(hidden_states, extended_attention_mask)
 
     return hidden_states
 
