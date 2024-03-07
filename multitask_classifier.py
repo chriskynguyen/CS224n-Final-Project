@@ -73,10 +73,10 @@ class MultitaskBERT(nn.Module):
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
         self.sentiment_classifier = nn.Linear(config.hidden_size, 5)
-        
-        self.paraphrase_classifier = nn.Linear(2*config.hidden_size, 1)
-        
-        self.similarity_classifier = nn.Linear(2*config.hidden_size, 1)
+
+        self.paraphrase_classifier = nn.Linear(config.hidden_size*2, 1)
+
+        self.similarity_classifier = nn.Linear(config.hidden_size*2, 1)
 
 
     def forward(self, input_ids, attention_mask):
@@ -200,9 +200,19 @@ def train_multitask(args):
     model = model.to(device)
 
     lr = args.lr
+
     optimizer = AdamW(model.parameters(), lr=lr)
-    best_dev_acc = 0
+    best_dev_acc = [0. for i in range(3)]
     steps_per_epoch = 2000
+
+    # Calculate warmup steps (10% of total steps)
+    warmup_steps = steps_per_epoch * 0.1
+    step = 0
+    # Define a learning rate scheduler for linear warmup and decay
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lr_lambda= lambda step:args.lr * min((step + 1) / warmup_steps, 1.0) * max(1.0 - (step + 1 - warmup_steps) / (steps_per_epoch - warmup_steps), 0)
+    )
 
     # Run for the specified number of epochs.
     for epoch in range(args.epochs):
@@ -248,7 +258,8 @@ def train_multitask(args):
                                                 input_ids2.to(device), attention_mask2.to(device))
                 loss = F.mse_loss(logits, labels.view(-1, 1), reduction='sum') / args.batch_size
             loss.backward()
-            optimizer.step()
+            optimizer.step() # update model parameters
+            scheduler.step() # update learning rate
 
             train_loss[task_id] += loss.item() 
             num_batches[task_id] += 1
@@ -259,10 +270,19 @@ def train_multitask(args):
         dev_acc_sst, _, _, dev_acc_para, _, _, dev_acc_sts, _, _ = model_eval_multitask(sst_dev_dataloader, para_dev_dataloader, sts_dev_dataloader, model, device)
 
         dev_acc = [dev_acc_sst, dev_acc_para, dev_acc_sts]
-        if any(acc > best_dev_acc for acc in dev_acc):
-            best_dev_acc = max(dev_acc)
+        """
+        dev_count = 0
+        # make sure all accuracies are increasing other 
+        for i in range(len(dev_acc)):
+            if dev_acc[i] > best_dev_acc[i]:
+                best_dev_acc[i] = dev_acc[i]
+                dev_count += 1
+        if dev_count == 3:
             save_model(model, optimizer, args, config, args.filepath)
-
+        """
+        if any(dev_acc[i] > best_dev_acc[i] for i in range(len(dev_acc))):
+            best_dev_acc = [max(dev_acc[i], best_dev_acc[i]) for i in range(len(dev_acc))]
+            save_model(model, optimizer, args, config, args.filepath)
         print(f"Epoch {epoch}: train avg loss sst:: {train_avg_loss[0]:.3f}, train avg loss para:: {train_avg_loss[1]:.3f}, train avg loss sts:: {train_avg_loss[2]:.3f}")
 
 
@@ -397,7 +417,7 @@ class GEM(nn.Module):
                     ptloss = F.mse_loss(logits, labels.view(-1, 1), reduction='sum') / self.args.batch_size
                 ptloss.backward()
                 # store gradients
-                self.store_grad(self.model.parameters, self.grads, self.grad_dims, past_task)
+                self.store_grad(self.model.bert.parameters, self.grads, self.grad_dims, past_task)
 
         # compute gradient on current batch
         self.opt.zero_grad()
@@ -407,20 +427,20 @@ class GEM(nn.Module):
         elif task_id == 1:
             loss = F.binary_cross_entropy_with_logits(logits, labels.view(-1, 1), reduction='sum') / self.args.batch_size
         else:
-            loss = F.mse_loss(logits, labels.view(-1, 1), reduction='sum') / args.batch_size
+            loss = F.mse_loss(logits, labels.view(-1, 1), reduction='sum') / self.args.batch_size
         loss.backward()
 
         # check if gradient violates constraints
         if len(self.observed_tasks) > 1:
             # copy gradient
-            self.store_grad(self.model.parameters, self.grads, self.grad_dims, task_id)
+            self.store_grad(self.model.bert.parameters, self.grads, self.grad_dims, task_id)
             indx = torch.cuda.LongTensor(self.observed_tasks[:-1]) if self.args.use_gpu \
                 else torch.LongTensor(self.observed_tasks[:-1])
             dotp = torch.mm(self.grads[:, task_id].unsqueeze(0), self.grads.index_select(1, indx))
             if (dotp < 0).sum() != 0:
                 self.project2cone2(self.grads[:, task_id].unsqueeze(1), self.grads.index_select(1, indx), self.margin)
-                # copt gradients back
-                self.overwrite_grad(self.model.parameters, self.grads[:, task_id], self.grad_dims)
+                # copy gradients back
+                self.overwrite_grad(self.model.bert.parameters, self.grads[:, task_id], self.grad_dims)
         
         self.opt.step()
         return loss.item()
@@ -480,25 +500,28 @@ def train_multitask_GEM(args):
     tasks = ["SST", "QQP", "STS"]
     loaders = [sst_train_dataloader, para_train_dataloader, sts_train_dataloader]
     gem = GEM(args, model, device, optimizer, 1, 3)
+
+     # Calculate warmup steps (10% of total steps)
+    steps_per_task = [len(sst_train_dataloader), len(para_train_dataloader), len(sts_train_dataloader)]
+    warmup_steps_per_task = [steps * 0.1 for steps in steps_per_task]
+    step = 0
+    # Define a learning rate scheduler for linear warmup and decay
+    schedulers = [torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lr_lambda=lambda step, warmup_steps=warmup_steps, total_steps=total_steps: args.lr * min((step + 1) / warmup_steps, 1.0) * max(1.0 - (step + 1 - warmup_steps) / (total_steps - warmup_steps), 0)
+    ) for warmup_steps, total_steps in zip(warmup_steps_per_task, steps_per_task)]
     for epoch in range(args.epochs):
         model.train()
         train_loss = [0. for i in range(3)] # separate loss for each task
         num_batches = [0. for i in range(3)]
         for task_id, dataloader in enumerate(loaders): # train task sequentially
+            scheduler = schedulers[task_id]
             for batch in tqdm(dataloader, desc=f'train-{epoch}, {tasks[task_id]}', disable=TQDM_DISABLE):
-                """
-                if task_id == 0:
-                    input_ids, attention_mask, labels = batch['token_ids'], batch['attention_mask'], batch['labels']
-                    tensor_batch = torch.stack([input_ids, attention_mask, labels.repeat(1, input_ids.shape[1])])
-                elif task_id == 1:
-                    input_ids1, attention_mask1, input_ids2, attention_mask2, labels = (
-                        batch['token_ids_1'], batch['attention_mask_1'], batch['token_ids_2'], batch['attention_mask_2'], batch['labels'])
-                    tensor_batch = torch.stack([inputs_ids1, attention_mask1, input_ids2, attention_mask2, labels.repeat(1, input_ids1.shape[1])])
-                """
                 train_loss[task_id] += gem.observe(task_id, batch)
+                scheduler.step()
                 num_batches[task_id] += 1
 
-        train_avg_loss = [loss / num_batches[i] if num_batches[i] != 0 else 0 for i, loss in enumerate(train_loss)] # Average loss over all batches
+        train_avg_loss = [loss / num_batches[i] for i, loss in enumerate(train_loss)] # Average loss over all batches
 
         train_acc_sst, _, _, train_acc_para, _, _, train_acc_sts, _, _ = model_eval_multitask(sst_train_dataloader, para_train_dataloader, sts_train_dataloader, model, device)
         dev_acc_sst, _, _, dev_acc_para, _, _, dev_acc_sts, _, _ = model_eval_multitask(sst_dev_dataloader, para_dev_dataloader, sts_dev_dataloader, model, device)
@@ -634,7 +657,7 @@ def get_args():
     parser.add_argument("--lr", type=float, help="learning rate", default=1e-5)
 
     parser.add_argument("--use_gem", action='store_true')
-    parser.add_argument("--memory_strength", type=float, default=0)
+    parser.add_argument("--memory_strength", type=float, default=0.5)
 
     args = parser.parse_args()
     return args
@@ -644,7 +667,7 @@ if __name__ == "__main__":
     args = get_args()
     args.filepath = f'{args.option}-{args.epochs}-{args.lr}-multitask.pt' # Save path.
     seed_everything(args.seed)  # Fix the seed for reproducibility.
-    if args.use_gem:
+    if args.option == 'finetune' and args.use_gem:
         train_multitask_GEM(args)
     else:
         train_multitask(args)
