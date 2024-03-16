@@ -18,11 +18,13 @@ from types import SimpleNamespace
 import torch
 from torch import nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, RandomSampler
 
 from bert import BertModel
 from optimizer import AdamW
 from tqdm import tqdm
+
+import matplotlib.pyplot as plt
 
 import quadprog # used to solve QP
 
@@ -72,11 +74,24 @@ class MultitaskBERT(nn.Module):
         ### TODO
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
-        self.sentiment_classifier = nn.Linear(config.hidden_size, 5)
-        
-        self.paraphrase_classifier = nn.Linear(2*config.hidden_size, 1)
-        
-        self.similarity_classifier = nn.Linear(2*config.hidden_size, 1)
+        self.sentiment_classifier = nn.Sequential(
+            nn.Linear(config.hidden_size, config.hidden_size),
+            nn.ReLU(),
+            nn.Dropout(p=0.1),
+            nn.Linear(config.hidden_size, 5)
+        )
+        self.paraphrase_classifier = nn.Sequential(
+            nn.Linear(config.hidden_size*2, config.hidden_size),
+            nn.ReLU(),
+            nn.Dropout(p=0.1),
+            nn.Linear(config.hidden_size, 1)
+        )
+        self.similarity_classifier = nn.Sequential(
+            nn.Linear(config.hidden_size*2, config.hidden_size),
+            nn.ReLU(),
+            nn.Dropout(p=0.1),
+            nn.Linear(config.hidden_size, 1),
+        )
 
 
     def forward(self, input_ids, attention_mask):
@@ -156,36 +171,39 @@ def train_multitask(args):
     '''
     device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
     # Create the data and its corresponding datasets and dataloader.
-    # Sentiment Analysis dataset (SST)
+
     sst_train_data, num_labels,para_train_data, sts_train_data = load_multitask_data(args.sst_train,args.para_train,args.sts_train, split ='train')
     sst_dev_data, num_labels,para_dev_data, sts_dev_data = load_multitask_data(args.sst_dev,args.para_dev,args.sts_dev, split ='train')
 
+    # Sentiment Analysis dataset (SST)
     sst_train_data = SentenceClassificationDataset(sst_train_data, args)
     sst_dev_data = SentenceClassificationDataset(sst_dev_data, args)
+
+    # Paraphrase Detection dataset (Quora)
+    para_train_data = SentencePairDataset(para_train_data, args)
+    para_dev_data = SentencePairDataset(para_dev_data, args)
+
+    # Semantic Textual Similarity (STS)
+    sts_train_data = SentencePairDataset(sts_train_data, args, isRegression=True)
+    sts_dev_data = SentencePairDataset(sts_dev_data, args, isRegression=True)
 
     sst_train_dataloader = DataLoader(sst_train_data, shuffle=True, batch_size=args.batch_size,
                                       collate_fn=sst_train_data.collate_fn)
     sst_dev_dataloader = DataLoader(sst_dev_data, shuffle=False, batch_size=args.batch_size,
                                     collate_fn=sst_dev_data.collate_fn)
 
-    # Paraphrase Detection dataset (Quora)
-    para_train_data = SentencePairDataset(para_train_data, args)
-    para_dev_data = SentencePairDataset(para_dev_data, args)
-
     para_train_dataloader = DataLoader(para_train_data, shuffle=True, batch_size=args.batch_size,
                                         collate_fn=para_train_data.collate_fn)
     para_dev_dataloader = DataLoader(para_dev_data, shuffle=False, batch_size=args.batch_size,
                                         collate_fn=para_dev_data.collate_fn)
 
-    # Semantic Textual Similarity (STS)
-    sts_train_data = SentencePairDataset(sts_train_data, args, isRegression=True)
-    sts_dev_data = SentencePairDataset(sts_dev_data, args, isRegression=True)
 
     sts_train_dataloader = DataLoader(sts_train_data, shuffle=True, batch_size=args.batch_size,
                                         collate_fn=sts_train_data.collate_fn)
     sts_dev_dataloader = DataLoader(sts_dev_data, shuffle=False, batch_size=args.batch_size,
                                     collate_fn=sts_dev_data.collate_fn)
     
+    loaders = [sst_train_dataloader, para_train_dataloader, sts_train_dataloader]
 
     # Init model.
     config = {'hidden_dropout_prob': args.hidden_dropout_prob,
@@ -200,9 +218,13 @@ def train_multitask(args):
     model = model.to(device)
 
     lr = args.lr
-    optimizer = AdamW(model.parameters(), lr=lr)
-    best_dev_acc = 0
-    steps_per_epoch = 2000
+    steps_per_epoch = 2400
+    optimizer = AdamW(model.parameters(), lr=lr, warmup_steps=0.1*steps_per_epoch, total_steps=3*args.epochs*steps_per_epoch)
+    best_dev_acc = [0. for i in range(3)]
+
+    # use for plotting
+    train_acc_history = [[] for _ in range(3)] 
+    dev_acc_history = [[] for _ in range(3)] 
 
     # Run for the specified number of epochs.
     for epoch in range(args.epochs):
@@ -219,18 +241,15 @@ def train_multitask(args):
         task_id = 0
         for step in tqdm(range(steps_per_epoch), desc=f'train-{epoch}', disable=TQDM_DISABLE):
             task_id = np.random.choice(3, p=probs)
-
+            batch = next(iter(loaders[task_id]))
             # Load batch based on task ID
             if task_id == 0:
-                batch = next(iter(sst_train_dataloader))
                 input_ids, attention_mask, labels = batch['token_ids'], batch['attention_mask'], batch['labels']
                 labels = labels.to(device)
                 optimizer.zero_grad()
                 logits = model.predict_sentiment(input_ids.to(device), attention_mask.to(device))
-                loss = F.cross_entropy(logits, labels.view(-1), reduction='sum') / args.batch_size
-                
+                loss = F.cross_entropy(logits, labels.view(-1), reduction='sum') / args.batch_size  
             elif task_id == 1:
-                batch = next(iter(para_train_dataloader))
                 input_ids1, attention_mask1, input_ids2, attention_mask2, labels = (
                     batch['token_ids_1'], batch['attention_mask_1'], batch['token_ids_2'], batch['attention_mask_2'], batch['labels'])
                 labels = labels.to(device).float()
@@ -239,7 +258,6 @@ def train_multitask(args):
                                                 input_ids2.to(device), attention_mask2.to(device))
                 loss = F.binary_cross_entropy_with_logits(logits, labels.view(-1, 1), reduction='sum') / args.batch_size
             elif task_id == 2:
-                batch = next(iter(sts_train_dataloader))
                 input_ids1, attention_mask1, input_ids2, attention_mask2, labels = (
                     batch['token_ids_1'], batch['attention_mask_1'], batch['token_ids_2'], batch['attention_mask_2'], batch['labels'])
                 labels = labels.to(device).float()
@@ -248,8 +266,8 @@ def train_multitask(args):
                                                 input_ids2.to(device), attention_mask2.to(device))
                 loss = F.mse_loss(logits, labels.view(-1, 1), reduction='sum') / args.batch_size
             loss.backward()
-            optimizer.step()
-
+            optimizer.step() # update model parameters
+ 
             train_loss[task_id] += loss.item() 
             num_batches[task_id] += 1
 
@@ -258,14 +276,33 @@ def train_multitask(args):
         train_acc_sst, _, _, train_acc_para, _, _, train_acc_sts, _, _ = model_eval_multitask(sst_train_dataloader, para_train_dataloader, sts_train_dataloader, model, device)
         dev_acc_sst, _, _, dev_acc_para, _, _, dev_acc_sts, _, _ = model_eval_multitask(sst_dev_dataloader, para_dev_dataloader, sts_dev_dataloader, model, device)
 
+        # Store accuracy scores for each epoch
+        train_acc_history[0].append(train_acc_sst)
+        train_acc_history[1].append(train_acc_para)
+        train_acc_history[2].append(train_acc_sts)
+        dev_acc_history[0].append(dev_acc_sst)
+        dev_acc_history[1].append(dev_acc_para)
+        dev_acc_history[2].append(dev_acc_sts)
         dev_acc = [dev_acc_sst, dev_acc_para, dev_acc_sts]
-        if any(acc > best_dev_acc for acc in dev_acc):
-            best_dev_acc = max(dev_acc)
+
+        if any(dev_acc[i] > best_dev_acc[i] for i in range(len(dev_acc))):
+            best_dev_acc = [max(dev_acc[i], best_dev_acc[i]) for i in range(len(dev_acc))]
             save_model(model, optimizer, args, config, args.filepath)
-
+        
         print(f"Epoch {epoch}: train avg loss sst:: {train_avg_loss[0]:.3f}, train avg loss para:: {train_avg_loss[1]:.3f}, train avg loss sts:: {train_avg_loss[2]:.3f}")
-
-
+        
+    # Plot accuracy scores for each task
+    plt.figure(figsize=(10, 6))
+    for i in range(3):
+        plt.plot(range(args.epochs), train_acc_history[i], label=f'Train {tasks[i]}', linestyle='--')
+        plt.plot(range(args.epochs), dev_acc_history[i], label=f'Dev {tasks[i]}')
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy')
+    plt.title('Accuracy Scores for Each Epoch and Task')
+    plt.legend()
+    plt.grid(True)        
+    plt.save("PALs.png")
+        
 class GEM(nn.Module):
     def __init__(self, args, model, device, optimizer, memory_size, num_tasks):
         """
@@ -278,22 +315,19 @@ class GEM(nn.Module):
         self.memory_size = memory_size
         self.args = args
         self.opt = optimizer
-        self.device = device
         self.margin = self.args.memory_strength
+        self.device = device
+
         # allocate episodic memory
         self.memory_data = [[] for _ in range(num_tasks)] # each element stores the batched data dictionary
 
         self.grad_dims = []
         for param in self.model.parameters():
             self.grad_dims.append(param.data.numel())
-        self.grads = torch.Tensor(sum(self.grad_dims), num_tasks)
+        self.grads = torch.Tensor(sum(self.grad_dims), num_tasks).to(device)
         self.observed_tasks = []
         self.old_task = -1
         self.mem_cnt = 0
-
-        if self.args.use_gpu:
-            self.memory_data = self.memory_data
-            self.grads = self.grads.to(device)
 
     def forward(self, task_id, batch):
         if task_id == 0:
@@ -313,6 +347,15 @@ class GEM(nn.Module):
             logits = self.model.predict_similarity(input_ids1.to(self.device), attention_mask1.to(self.device),
                                             input_ids2.to(self.device), attention_mask2.to(self.device))
         return logits, labels
+
+    def compute_loss(self, task_id, logits, labels):
+        if task_id == 0:
+            loss = F.cross_entropy(logits, labels.view(-1), reduction='sum') / self.args.batch_size
+        elif task_id == 1:
+            loss = F.binary_cross_entropy_with_logits(logits, labels.view(-1, 1), reduction='sum') / self.args.batch_size
+        else:
+            loss = F.mse_loss(logits, labels.view(-1, 1), reduction='sum') / self.args.batch_size
+        return loss
 
     def store_grad(self, parameters, grads, grad_dims, task_id):
         """
@@ -377,9 +420,9 @@ class GEM(nn.Module):
 
         # update memory to store examples from current task
         if len(self.memory_data[task_id]) < self.memory_size:
-            self.memory_data[task_id].append(batch)
+            self.memory_data[task_id].append(batch.copy())
         else:
-            self.memory_data[task_id][self.mem_cnt] = batch
+            self.memory_data[task_id][self.mem_cnt] = batch.copy()
             self.mem_cnt = (self.mem_cnt + 1) % self.memory_size # resets mem_cnt if equal to memory_size
 
         # compute gradient on previous tasks 
@@ -389,38 +432,28 @@ class GEM(nn.Module):
                 #fwd/bwd on examples in memory
                 past_task = self.observed_tasks[tt]
                 logits, labels = self.forward(past_task, self.memory_data[past_task][0])
-                if past_task == 0:
-                    ptloss = F.cross_entropy(logits, labels.view(-1), reduction='sum') / self.args.batch_size
-                elif past_task == 1:
-                    ptloss = F.binary_cross_entropy_with_logits(logits, labels.view(-1, 1), reduction='sum') / self.args.batch_size
-                else:
-                    ptloss = F.mse_loss(logits, labels.view(-1, 1), reduction='sum') / self.args.batch_size
+                ptloss = self.compute_loss(past_task, logits, labels)
                 ptloss.backward()
                 # store gradients
-                self.store_grad(self.model.parameters, self.grads, self.grad_dims, past_task)
+                self.store_grad(self.model.bert.parameters, self.grads, self.grad_dims, past_task)
 
         # compute gradient on current batch
         self.opt.zero_grad()
         logits, labels = self.forward(task_id, batch)
-        if task_id == 0:
-            loss = F.cross_entropy(logits, labels.view(-1), reduction='sum') / self.args.batch_size
-        elif task_id == 1:
-            loss = F.binary_cross_entropy_with_logits(logits, labels.view(-1, 1), reduction='sum') / self.args.batch_size
-        else:
-            loss = F.mse_loss(logits, labels.view(-1, 1), reduction='sum') / args.batch_size
+        loss = self.compute_loss(task_id, logits, labels)
         loss.backward()
 
         # check if gradient violates constraints
         if len(self.observed_tasks) > 1:
             # copy gradient
-            self.store_grad(self.model.parameters, self.grads, self.grad_dims, task_id)
+            self.store_grad(self.model.bert.parameters, self.grads, self.grad_dims, task_id)
             indx = torch.cuda.LongTensor(self.observed_tasks[:-1]) if self.args.use_gpu \
                 else torch.LongTensor(self.observed_tasks[:-1])
             dotp = torch.mm(self.grads[:, task_id].unsqueeze(0), self.grads.index_select(1, indx))
             if (dotp < 0).sum() != 0:
                 self.project2cone2(self.grads[:, task_id].unsqueeze(1), self.grads.index_select(1, indx), self.margin)
-                # copt gradients back
-                self.overwrite_grad(self.model.parameters, self.grads[:, task_id], self.grad_dims)
+                # copy gradients back
+                self.overwrite_grad(self.model.bert.parameters, self.grads[:, task_id], self.grad_dims)
         
         self.opt.step()
         return loss.item()
@@ -430,37 +463,38 @@ def train_multitask_GEM(args):
     '''
     device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
     # Create the data and its corresponding datasets and dataloader.
-    # Sentiment Analysis dataset (SST)
+
     sst_train_data, num_labels,para_train_data, sts_train_data = load_multitask_data(args.sst_train,args.para_train,args.sts_train, split ='train')
     sst_dev_data, num_labels,para_dev_data, sts_dev_data = load_multitask_data(args.sst_dev,args.para_dev,args.sts_dev, split ='train')
 
+    # Sentiment Analysis dataset (SST)
     sst_train_data = SentenceClassificationDataset(sst_train_data, args)
     sst_dev_data = SentenceClassificationDataset(sst_dev_data, args)
+
+    # Paraphrase Detection dataset (Quora)
+    para_train_data = SentencePairDataset(para_train_data, args)
+    para_dev_data = SentencePairDataset(para_dev_data, args)
+
+    # Semantic Textual Similarity (STS)
+    sts_train_data = SentencePairDataset(sts_train_data, args, isRegression=True)
+    sts_dev_data = SentencePairDataset(sts_dev_data, args, isRegression=True)
 
     sst_train_dataloader = DataLoader(sst_train_data, shuffle=True, batch_size=args.batch_size,
                                       collate_fn=sst_train_data.collate_fn)
     sst_dev_dataloader = DataLoader(sst_dev_data, shuffle=False, batch_size=args.batch_size,
                                     collate_fn=sst_dev_data.collate_fn)
 
-    # Paraphrase Detection dataset (Quora)
-    para_train_data = SentencePairDataset(para_train_data, args)
-    para_dev_data = SentencePairDataset(para_dev_data, args)
-
     para_train_dataloader = DataLoader(para_train_data, shuffle=True, batch_size=args.batch_size,
                                         collate_fn=para_train_data.collate_fn)
     para_dev_dataloader = DataLoader(para_dev_data, shuffle=False, batch_size=args.batch_size,
                                         collate_fn=para_dev_data.collate_fn)
-
-    # Semantic Textual Similarity (STS)
-    sts_train_data = SentencePairDataset(sts_train_data, args, isRegression=True)
-    sts_dev_data = SentencePairDataset(sts_dev_data, args, isRegression=True)
 
     sts_train_dataloader = DataLoader(sts_train_data, shuffle=True, batch_size=args.batch_size,
                                         collate_fn=sts_train_data.collate_fn)
     sts_dev_dataloader = DataLoader(sts_dev_data, shuffle=False, batch_size=args.batch_size,
                                     collate_fn=sts_dev_data.collate_fn)
     
-    
+
     # Init model.
     config = {'hidden_dropout_prob': args.hidden_dropout_prob,
               'num_labels': num_labels,
@@ -474,42 +508,74 @@ def train_multitask_GEM(args):
     model = model.to(device)
 
     lr = args.lr
-    optimizer = AdamW(model.parameters(), lr=lr)
-    best_dev_acc = 0
 
+    
+    # follow proposed continual learning structure where number of samples per task is small
+    if args.batches_per_task > 0: 
+        batches = [len(sst_train_dataloader), len(para_train_dataloader), len(sts_train_dataloader)]
+        batches = [int(num * args.batches_per_task) for num in batches]
+    else:
+        batches = [len(sst_train_dataloader), len(para_train_dataloader), len(sts_train_dataloader)] 
+        
+    total_batches = sum(batches)
+    optimizer = AdamW(model.parameters(), lr=lr, warmup_steps=0.1*total_batches, total_steps=3*args.epochs*total_batches) # Learning rate warmup and decay
+    best_dev_acc = [0. for i in range(3)]
+
+    loaders = {'0': sst_train_dataloader, '1': para_train_dataloader, '2': sts_train_dataloader}
     tasks = ["SST", "QQP", "STS"]
-    loaders = [sst_train_dataloader, para_train_dataloader, sts_train_dataloader]
+    task_keys = list(loaders.keys())
+
     gem = GEM(args, model, device, optimizer, 1, 3)
+    
+    train_acc_history = [[] for _ in range(3)]  # Three tasks
+    dev_acc_history = [[] for _ in range(3)]
+    
     for epoch in range(args.epochs):
+        random.shuffle(task_keys) # shuffle order of tasks
+        shuffled_tasks = {t: loaders[t] for t in task_keys}
+
         model.train()
         train_loss = [0. for i in range(3)] # separate loss for each task
         num_batches = [0. for i in range(3)]
-        for task_id, dataloader in enumerate(loaders): # train task sequentially
-            for batch in tqdm(dataloader, desc=f'train-{epoch}, {tasks[task_id]}', disable=TQDM_DISABLE):
-                """
-                if task_id == 0:
-                    input_ids, attention_mask, labels = batch['token_ids'], batch['attention_mask'], batch['labels']
-                    tensor_batch = torch.stack([input_ids, attention_mask, labels.repeat(1, input_ids.shape[1])])
-                elif task_id == 1:
-                    input_ids1, attention_mask1, input_ids2, attention_mask2, labels = (
-                        batch['token_ids_1'], batch['attention_mask_1'], batch['token_ids_2'], batch['attention_mask_2'], batch['labels'])
-                    tensor_batch = torch.stack([inputs_ids1, attention_mask1, input_ids2, attention_mask2, labels.repeat(1, input_ids1.shape[1])])
-                """
+        
+        for task_id in shuffled_tasks.keys():
+            task_id = int(task_id)
+            for _ in tqdm(range(batches[task_id]), desc=f'train-{epoch}, {tasks[task_id]}', disable=TQDM_DISABLE):
+                batch = next(iter(shuffled_tasks[str(task_id)]))
                 train_loss[task_id] += gem.observe(task_id, batch)
                 num_batches[task_id] += 1
 
-        train_avg_loss = [loss / num_batches[i] if num_batches[i] != 0 else 0 for i, loss in enumerate(train_loss)] # Average loss over all batches
+        train_avg_loss = [loss / num_batches[i] for i, loss in enumerate(train_loss)] # Average loss over all batches
 
         train_acc_sst, _, _, train_acc_para, _, _, train_acc_sts, _, _ = model_eval_multitask(sst_train_dataloader, para_train_dataloader, sts_train_dataloader, model, device)
         dev_acc_sst, _, _, dev_acc_para, _, _, dev_acc_sts, _, _ = model_eval_multitask(sst_dev_dataloader, para_dev_dataloader, sts_dev_dataloader, model, device)
 
+        # Store accuracy scores for each epoch
+        train_acc_history[0].append(train_acc_sst)
+        train_acc_history[1].append(train_acc_para)
+        train_acc_history[2].append(train_acc_sts)
+        dev_acc_history[0].append(dev_acc_sst)
+        dev_acc_history[1].append(dev_acc_para)
+        dev_acc_history[2].append(dev_acc_sts)
+        
         dev_acc = [dev_acc_sst, dev_acc_para, dev_acc_sts]
-        if any(acc > best_dev_acc for acc in dev_acc):
-            best_dev_acc = max(dev_acc)
+        if any(dev_acc[i] > best_dev_acc[i] for i in range(len(dev_acc))):
+            best_dev_acc = [max(dev_acc[i], best_dev_acc[i]) for i in range(len(dev_acc))]
             save_model(model, optimizer, args, config, args.filepath)
 
         print(f"Epoch {epoch}: train avg loss sst:: {train_avg_loss[0]:.3f}, train avg loss para:: {train_avg_loss[1]:.3f}, train avg loss sts:: {train_avg_loss[2]:.3f}")
-                
+        
+    # Plot accuracy scores for each task
+    plt.figure(figsize=(10, 6))
+    for i in range(3):
+        plt.plot(range(args.epochs), train_acc_history[i], label=f'Train {tasks[i]}', linestyle='--')
+        plt.plot(range(args.epochs), dev_acc_history[i], label=f'Dev {tasks[i]}')
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy')
+    plt.title('Accuracy Scores for Each Epoch and Task')
+    plt.legend()
+    plt.grid(True)        
+    plt.save("GEM.png")
 
 def test_multitask(args):
     '''Test and save predictions on the dev and test sets of all three tasks.'''
@@ -634,8 +700,8 @@ def get_args():
     parser.add_argument("--lr", type=float, help="learning rate", default=1e-5)
 
     parser.add_argument("--use_gem", action='store_true')
-    parser.add_argument("--memory_strength", type=float, default=0)
-
+    parser.add_argument("--memory_strength", type=float, default=0.5)
+    parser.add_argument("--batches_per_task", type=float, default=-1)
     args = parser.parse_args()
     return args
 

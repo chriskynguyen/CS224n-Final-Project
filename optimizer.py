@@ -14,6 +14,8 @@ class AdamW(Optimizer):
             eps: float = 1e-6,
             weight_decay: float = 0.01, # changed from: 0.0
             correct_bias: bool = True,
+            warmup_steps: int = 0,
+            total_steps: int = 0,
     ):
         if lr < 0.0:
             raise ValueError("Invalid learning rate: {} - should be >= 0.0".format(lr))
@@ -23,7 +25,7 @@ class AdamW(Optimizer):
             raise ValueError("Invalid beta parameter: {} - should be in [0.0, 1.0[".format(betas[1]))
         if not 0.0 <= eps:
             raise ValueError("Invalid epsilon value: {} - should be >= 0.0".format(eps))
-        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay, correct_bias=correct_bias)
+        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay, correct_bias=correct_bias, warmup_steps=warmup_steps, total_steps=total_steps)
         super().__init__(params, defaults)
 
     def step(self, closure: Callable = None):
@@ -60,17 +62,31 @@ class AdamW(Optimizer):
                 # Refer to the default project handout for more details.
 
                 ### TODO: FINISHED
-                # Access the remaining paramters from group
+
+                # Access the remaining parameters from group
                 beta1, beta2 = group["betas"][0], group["betas"][1]
                 eps = group["eps"]
                 weight_decay = group["weight_decay"]
 
+                
                 # Initialize state (only if not initialized already)
                 # p.data == theta in pseudo-code
                 if len(state) == 0:
                     state['step'] = 0
                     state['m_t'] = torch.zeros_like(p.data) # exponential moving averages of gradient
                     state['v_t'] = torch.zeros_like(p.data) # squared gradient
+                
+                step = state['step']
+                warmup_steps = group["warmup_steps"]
+                total_steps = group["total_steps"]
+                if total_steps != -1:
+                    # Linear warm-up
+                    if step <= warmup_steps:
+                        alpha = alpha * (step / warmup_steps)
+
+                    # Linear decay
+                    if step > warmup_steps:
+                        alpha *= max(0.0, (total_steps - step) / (total_steps - warmup_steps))
                 
                 state['step'] += 1
                 # Update biased first moment estimate
@@ -81,8 +97,11 @@ class AdamW(Optimizer):
                 # Efficient version of algorithm explained in pseudo-code note
                 alpha_t = alpha * (1 - beta2**state["step"])**0.5 / (1 - beta1**state["step"])
                 p.data -= alpha_t * state['m_t'] / (torch.sqrt(state['v_t']) + eps)
+
                 # Apply weight decay
                 if weight_decay != 0:
                     p.data -= alpha * weight_decay * p.data
+                
+
                 
         return loss
