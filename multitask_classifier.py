@@ -7,6 +7,8 @@ Of note are:
     copies training procedure from `classifier.py` (single-task SST).
 * function test_multitask: Test procedure for MultitaskBERT. This function generates
     the required files for submission.
+* GEM class is based on open source code by David Lopez-Paz and Marc’Aurelio Ranzato:
+    https://github.com/facebookresearch/GradientEpisodicMemory/tree/master
 
 Running `python multitask_classifier.py` trains and tests your MultitaskBERT and
 writes all required submission files.
@@ -292,6 +294,7 @@ def train_multitask(args):
         print(f"Epoch {epoch}: train avg loss sst:: {train_avg_loss[0]:.3f}, train avg loss para:: {train_avg_loss[1]:.3f}, train avg loss sts:: {train_avg_loss[2]:.3f}")
         
     # Plot accuracy scores for each task
+    tasks = ["SST", "QQP", "STS"]
     plt.figure(figsize=(10, 6))
     for i in range(3):
         plt.plot(range(args.epochs), train_acc_history[i], label=f'Train {tasks[i]}', linestyle='--')
@@ -301,7 +304,7 @@ def train_multitask(args):
     plt.title('Accuracy Scores for Each Epoch and Task')
     plt.legend()
     plt.grid(True)        
-    plt.save("PALs.png")
+    plt.savefig("PALs.png")
         
 class GEM(nn.Module):
     def __init__(self, args, model, device, optimizer, memory_size, num_tasks):
@@ -428,14 +431,15 @@ class GEM(nn.Module):
         # compute gradient on previous tasks 
         if len(self.observed_tasks) > 1:
             for tt in range(len(self.observed_tasks) - 1): # only get past tasks not recently added task
-                self.opt.zero_grad()
-                #fwd/bwd on examples in memory
                 past_task = self.observed_tasks[tt]
-                logits, labels = self.forward(past_task, self.memory_data[past_task][0])
-                ptloss = self.compute_loss(past_task, logits, labels)
-                ptloss.backward()
-                # store gradients
-                self.store_grad(self.model.bert.parameters, self.grads, self.grad_dims, past_task)
+                for past_batch in self.memory_data[past_task]:
+                    self.opt.zero_grad()
+                    #fwd/bwd on examples in memory
+                    logits, labels = self.forward(past_task, past_batch)
+                    ptloss = self.compute_loss(past_task, logits, labels)
+                    ptloss.backward()
+                    # store gradients
+                    self.store_grad(self.model.bert.parameters, self.grads, self.grad_dims, past_task)
 
         # compute gradient on current batch
         self.opt.zero_grad()
@@ -512,70 +516,44 @@ def train_multitask_GEM(args):
     
     # follow proposed continual learning structure where number of samples per task is small
     if args.batches_per_task > 0: 
-        batches = [len(sst_train_dataloader), len(para_train_dataloader), len(sts_train_dataloader)]
-        batches = [int(num * args.batches_per_task) for num in batches]
+        batches = args.batches_per_task
     else:
-        batches = [len(sst_train_dataloader), len(para_train_dataloader), len(sts_train_dataloader)] 
-        
-    total_batches = sum(batches)
-    optimizer = AdamW(model.parameters(), lr=lr, warmup_steps=0.1*total_batches, total_steps=3*args.epochs*total_batches) # Learning rate warmup and decay
+        batches = min([len(sst_train_dataloader), len(para_train_dataloader), len(sts_train_dataloader)])
+  
+
+    optimizer = AdamW(model.parameters(), lr=lr, warmup_steps=0.1*batches, total_steps=-1) # No learning rate warmup and decay
     best_dev_acc = [0. for i in range(3)]
 
     loaders = {'0': sst_train_dataloader, '1': para_train_dataloader, '2': sts_train_dataloader}
     tasks = ["SST", "QQP", "STS"]
     task_keys = list(loaders.keys())
 
-    gem = GEM(args, model, device, optimizer, 1, 3)
+    gem = GEM(args, model, device, optimizer, args.memory_size, 3)
     
     train_acc_history = [[] for _ in range(3)]  # Three tasks
     dev_acc_history = [[] for _ in range(3)]
     
-    for epoch in range(args.epochs):
-        random.shuffle(task_keys) # shuffle order of tasks
-        shuffled_tasks = {t: loaders[t] for t in task_keys}
 
-        model.train()
-        train_loss = [0. for i in range(3)] # separate loss for each task
-        num_batches = [0. for i in range(3)]
-        
-        for task_id in shuffled_tasks.keys():
-            task_id = int(task_id)
-            for _ in tqdm(range(batches[task_id]), desc=f'train-{epoch}, {tasks[task_id]}', disable=TQDM_DISABLE):
+    random.shuffle(task_keys) # shuffle order of tasks
+    shuffled_tasks = {t: loaders[t] for t in task_keys}
+
+    model.train()
+    train_loss = [0. for i in range(3)] # separate loss for each task
+    num_batches = [0. for i in range(3)]
+    
+    for task_id in shuffled_tasks.keys():
+        task_id = int(task_id)
+        for epoch in range(args.epochs):
+            for _ in tqdm(range(batches), desc=f'train-{epoch}, {tasks[task_id]}', disable=TQDM_DISABLE):
                 batch = next(iter(shuffled_tasks[str(task_id)]))
                 train_loss[task_id] += gem.observe(task_id, batch)
                 num_batches[task_id] += 1
 
-        train_avg_loss = [loss / num_batches[i] for i, loss in enumerate(train_loss)] # Average loss over all batches
+            train_avg_loss = train_loss[task_id] / (num_batches)[task_id]
+            print(f"Epoch {epoch}: train loss: {train_avg_loss:.3f}")
 
-        train_acc_sst, _, _, train_acc_para, _, _, train_acc_sts, _, _ = model_eval_multitask(sst_train_dataloader, para_train_dataloader, sts_train_dataloader, model, device)
         dev_acc_sst, _, _, dev_acc_para, _, _, dev_acc_sts, _, _ = model_eval_multitask(sst_dev_dataloader, para_dev_dataloader, sts_dev_dataloader, model, device)
-
-        # Store accuracy scores for each epoch
-        train_acc_history[0].append(train_acc_sst)
-        train_acc_history[1].append(train_acc_para)
-        train_acc_history[2].append(train_acc_sts)
-        dev_acc_history[0].append(dev_acc_sst)
-        dev_acc_history[1].append(dev_acc_para)
-        dev_acc_history[2].append(dev_acc_sts)
-        
-        dev_acc = [dev_acc_sst, dev_acc_para, dev_acc_sts]
-        if any(dev_acc[i] > best_dev_acc[i] for i in range(len(dev_acc))):
-            best_dev_acc = [max(dev_acc[i], best_dev_acc[i]) for i in range(len(dev_acc))]
-            save_model(model, optimizer, args, config, args.filepath)
-
-        print(f"Epoch {epoch}: train avg loss sst:: {train_avg_loss[0]:.3f}, train avg loss para:: {train_avg_loss[1]:.3f}, train avg loss sts:: {train_avg_loss[2]:.3f}")
-        
-    # Plot accuracy scores for each task
-    plt.figure(figsize=(10, 6))
-    for i in range(3):
-        plt.plot(range(args.epochs), train_acc_history[i], label=f'Train {tasks[i]}', linestyle='--')
-        plt.plot(range(args.epochs), dev_acc_history[i], label=f'Dev {tasks[i]}')
-    plt.xlabel('Epoch')
-    plt.ylabel('Accuracy')
-    plt.title('Accuracy Scores for Each Epoch and Task')
-    plt.legend()
-    plt.grid(True)        
-    plt.save("GEM.png")
+        save_model(model, optimizer, args, config, args.filepath)
 
 def test_multitask(args):
     '''Test and save predictions on the dev and test sets of all three tasks.'''
@@ -701,7 +679,8 @@ def get_args():
 
     parser.add_argument("--use_gem", action='store_true')
     parser.add_argument("--memory_strength", type=float, default=0.5)
-    parser.add_argument("--batches_per_task", type=float, default=-1)
+    parser.add_argument("--memory_size", type=int, default=10)
+    parser.add_argument("--batches_per_task", type=int, default=-1)
     args = parser.parse_args()
     return args
 
